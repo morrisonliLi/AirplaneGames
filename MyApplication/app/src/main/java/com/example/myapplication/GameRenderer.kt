@@ -5,15 +5,42 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.opengl.Matrix
+import android.os.SystemClock
 import com.example.myapplication.R
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.util.LinkedList
 import java.util.concurrent.CopyOnWriteArrayList
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
+/**
+ * 启动应用
+ *   │
+ *   ▼
+ * 创建GameRenderer实例
+ *   │
+ *   ▼
+ * onSurfaceCreated ──→ 加载着色器/纹理/初始化资源
+ *   │
+ *   ▼
+ * onSurfaceChanged ──→ 设置视口/初始化矩阵
+ *   │
+ *   ▼
+ * 主循环开始 → onDrawFrame（持续循环）
+ *   │   ├─→ 更新游戏逻辑
+ *   │   ├─→ 绘制游戏对象
+ *   │   └─→ 绘制UI元素
+ *   │
+ *   ▼
+ * 用户触摸事件 → handleTouch
+ *   │   ├─→ 坐标转换
+ *   │   └─→ 更新游戏状态
+ *   │
+ *   ▼
+ * 退出时自动释放OpenGL资源
+ *
+ */
 class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
     // Shader codes and matrix tools
     private val vertexShaderCode = """
@@ -45,6 +72,37 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
         gl_FragColor = vec4(red, 0.0, 0.0, red);
     }"""
 
+    // 边缘效果着色器代码
+    private val edgeVertexShaderCode = """
+        attribute vec4 aPosition;
+        varying vec2 vUV;
+        void main() {
+            gl_Position = aPosition;
+            vUV = (aPosition.xy + 1.0) * 0.5; // 转换到0-1范围
+        }
+    """
+
+    private val edgeFragmentShaderCode = """
+        precision mediump float;
+        varying vec2 vUV;
+        uniform float uRedIntensity;
+
+        void main() {
+            // 计算到边缘的距离（四个方向）
+            float edge = min(
+                min(vUV.x, 1.0 - vUV.x),
+                min(vUV.y, 1.0 - vUV.y)
+            );
+            
+            // 边缘渐变范围（0.05表示5%屏幕边缘）
+            float edgeWidth = 0.05;
+            float alpha = smoothstep(edgeWidth, 0.0, edge) * uRedIntensity;
+            
+            gl_FragColor = vec4(1.0, 0.0, 0.0, alpha);
+        }
+    """
+    private var edgePositionHandle = 0
+
     // OpenGL handles
     private var program = 0
     private var edgeProgram = 0
@@ -52,6 +110,7 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var maPositionHandle = 0
     private var maTexCoordHandle = 0
     private var edgeRedIntensityHandle = 0
+    private var edgeStartTime = 0L
 
     // Game objects
     private val asteroids = CopyOnWriteArrayList<Asteroid>()
@@ -78,6 +137,7 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private val screenWidth = context.resources.displayMetrics.widthPixels.toFloat()
     private val unitSizeX get() = 80f / screenWidth
     private val unitSizeY get() = 80f / screenHeight
+
     // 全屏顶点数据
     private val fullScreenCoords = floatArrayOf(
         -1.0f, -1.0f,  // 左下
@@ -124,14 +184,21 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // 设置背景色
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+        // 加载着色器程序
         initShaders()
+        // 加载所有纹理资源
         loadTextures()
+        // 初始化文字系统
         initText()
     }
 
+
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        // 设置视口尺寸
         GLES20.glViewport(0, 0, width, height)
+        // 初始化投影矩阵（正交投影）
         Matrix.orthoM(projectionMatrix, 0, 0f, 1f, 0f, 1f, -1f, 1f)
     }
 
@@ -148,25 +215,58 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        // 清空颜色缓冲区
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
+        // 更新游戏状态
         updateGameState()
+
+        // 绑定着色器程序
+        GLES20.glUseProgram(program)
+
+        // 绘制背景
         drawBackground()
-        drawAsteroids()
+
+        // 绘制玩家角色
         drawPlayer()
+
+        // 绘制小行星
+        drawAsteroids()
+
+        // 绘制爆炸效果
         drawExplosions()
+
+        // 绘制UI文字
         drawTexts()
+
+        // 全屏效果
         drawEdgeEffect()
     }
 
+
+    /**
+     * 编译着色器代码
+     * @param type 着色器类型（GLES20.GL_VERTEX_SHADER 或 GLES20.GL_FRAGMENT_SHADER）
+     * @param code GLSL着色器源代码字符串
+     * @return 生成的着色器对象ID（0表示失败）
+     */
     private fun initShaders() {
         program = createProgram(vertexShaderCode, fragmentShaderCode)
-        edgeProgram = createProgram(vertexShaderCode, edgeRedShaderCode)
+        // 编译边缘着色器
+        edgeProgram = GLES20.glCreateProgram().also {
+            val vertexShader = loadShader(GLES20.GL_VERTEX_SHADER, edgeVertexShaderCode)
+            val fragmentShader = loadShader(GLES20.GL_FRAGMENT_SHADER, edgeFragmentShaderCode)
+            GLES20.glAttachShader(it, vertexShader)
+            GLES20.glAttachShader(it, fragmentShader)
+            GLES20.glLinkProgram(it)
+        }
+
+        edgeRedIntensityHandle = GLES20.glGetUniformLocation(edgeProgram, "uRedIntensity")
+        edgePositionHandle = GLES20.glGetAttribLocation(edgeProgram, "aPosition")
 
         maPositionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         maTexCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
         muMVPMatrixHandle = GLES20.glGetUniformLocation(program, "uMVPMatrix")
-        edgeRedIntensityHandle = GLES20.glGetUniformLocation(edgeProgram, "uRedIntensity")
     }
 
     private fun createProgram(vertexCode: String, fragmentCode: String): Int {
@@ -186,6 +286,14 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
         }
     }
 
+    /**
+     * 加载游戏所需的所有纹理资源
+     * 初始化各游戏元素的纹理ID：
+     * - 背景纹理
+     * - 玩家角色纹理
+     * - 小行星纹理
+     * - 爆炸效果纹理
+     */
     private fun loadTextures() {
         backgroundTextureId = loadTexture(R.drawable.transparent)
         playerTextureId = loadTexture(R.drawable.ic_plant)
@@ -193,6 +301,11 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
         explosionTextureId = loadTexture(R.drawable.ic_one)
     }
 
+    /**
+     * 加载并配置纹理资源
+     * @param resId 图片资源ID
+     * @return 生成的纹理对象ID
+     */
     private fun loadTexture(resId: Int): Int {
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
@@ -206,10 +319,20 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
         return textures[0]
     }
 
+    /**
+     * 初始化文字显示系统
+     * 添加初始分数显示在屏幕右上角位置
+     */
     private fun initText() {
         addText("Score: 0", 0.1f, 0.9f)
     }
 
+    /**
+     * 添加文字到渲染队列
+     * @param text 要显示的文本内容
+     * @param x 水平位置（标准化坐标，0-1）
+     * @param y 垂直位置（标准化坐标，0-1）
+     */
     fun addText(text: String, x: Float, y: Float) {
         val bitmap = Bitmap.createBitmap(128, 64, Bitmap.Config.ARGB_8888).apply {
             val canvas = Canvas(this)
@@ -239,22 +362,33 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
         updateExplosions()
     }
 
+    /**
+     * 陨石生成算法
+     */
     private fun spawnAsteroids() {
         if (asteroids.size < 4 && Math.random() < 0.02) {
             val xPositions = listOf(0.1f, 0.3f, 0.6f, 0.8f)
-            asteroids.add(Asteroid(
-                x = xPositions[asteroids.size % 4],
-                y = 1.2f,
-                speed = 0.005f
-            ))
+            asteroids.add(
+                Asteroid(
+                    x = xPositions[asteroids.size % 4],
+                    y = 1.2f,
+                    speed = 0.005f
+                )
+            )
         }
     }
 
+    /**
+     * 更新陨石坐标
+     */
     private fun updatePositions() {
         asteroids.forEach { it.y -= it.speed }
         asteroids.removeIf { it.y < -0.2f }
     }
 
+    /**
+     * 遍历检查是否碰撞
+     */
     private fun checkCollisions() {
         asteroids.forEach { asteroid ->
             if (checkCollision(asteroid.x, asteroid.y, playerX, playerY)) {
@@ -265,10 +399,15 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
         }
     }
 
+    /**
+     * 碰撞检测算法
+     */
     private fun checkCollision(ax: Float, ay: Float, px: Float, py: Float): Boolean {
-        return !(ax + 0.05f < px - 0.01f ||
-                ax - 0.05f > px + 0.01f ||
-                ay - 0.05f > py + 0.01f)
+
+        return !(ax + 0.01f < px - 0.01f ||
+                ax - 0.01f > px + 0.01f ||
+                ay + 0.01f < py - 0.01f ||
+                ay - 0.01f > py + 0.01f)
     }
 
     private fun updateExplosions() {
@@ -307,30 +446,48 @@ class GameRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     private fun drawEdgeEffect() {
         if (collisionRedIntensity > 0) {
+            // 启用混合
+            GLES20.glEnable(GLES20.GL_BLEND)
+            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+
             GLES20.glUseProgram(edgeProgram)
             GLES20.glUniform1f(edgeRedIntensityHandle, collisionRedIntensity)
 
-            // 使用全屏顶点数据
-            GLES20.glUniformMatrix4fv(muMVPMatrixHandle, 1, false, identityMatrix(), 0)
-            GLES20.glEnableVertexAttribArray(maPositionHandle)
+            // 全屏四边形顶点数据（NDC坐标）
+            val vertices = floatArrayOf(
+                -1f, -1f,  // 左下
+                1f, -1f,   // 右下
+                -1f, 1f,   // 左上
+                1f, 1f     // 右上
+            )
+            val vertexBuffer = ByteBuffer.allocateDirect(vertices.size * 4)
+                .order(ByteOrder.nativeOrder())
+                .asFloatBuffer()
+                .apply {
+                    put(vertices)
+                    position(0)
+                }
+
+            // 设置顶点属性
+            GLES20.glEnableVertexAttribArray(edgePositionHandle)
             GLES20.glVertexAttribPointer(
-                maPositionHandle,
+                edgePositionHandle,
                 2,
                 GLES20.GL_FLOAT,
                 false,
                 0,
-                fullScreenVertexBuffer
+                vertexBuffer
             )
 
-            // 禁用纹理坐标属性
-            GLES20.glDisableVertexAttribArray(maTexCoordHandle)
-
-            // 绘制全屏三角形
+            // 绘制全屏四边形
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-            // 恢复默认程序
+            // 恢复状态
+            GLES20.glDisableVertexAttribArray(edgePositionHandle)
+            GLES20.glDisable(GLES20.GL_BLEND)
             GLES20.glUseProgram(program)
         }
+
     }
 
     private fun drawObject(matrix: FloatArray, textureId: Int) {
