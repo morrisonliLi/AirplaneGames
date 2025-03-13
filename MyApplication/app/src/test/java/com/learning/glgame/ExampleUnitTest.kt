@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.learning.glgame
 
 import org.junit.Test
 

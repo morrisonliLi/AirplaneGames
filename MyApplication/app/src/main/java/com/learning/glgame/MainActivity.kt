@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.learning.glgame
 
 import GameRenderer
 import android.opengl.GLSurfaceView
